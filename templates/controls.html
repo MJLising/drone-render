@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Drone Controls</title>
+  <style> /* ... trimmed: copy your existing styles ... */ 
+    :root{--bg:#0d1117;--card:#161b22;--accent:#06b6d4;--muted:#94a3b8;--danger:#ef4444}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;background:var(--bg);color:#e6eef6;display:flex;align-items:center;justify-content:center;height:100vh}
+    .card{width:360px;max-width:95vw;background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(0,0,0,.6)}
+    h1{font-size:18px;margin:0 0 8px}
+    .row{display:flex;gap:8px;margin:8px 0}
+    button{flex:1;padding:12px;border-radius:10px;border:0;background:#0b1220;color:#e6eef6;font-weight:600;box-shadow:inset 0 -2px 0 rgba(0,0,0,.25);touch-action:manipulation}
+    .btn-action{background:linear-gradient(180deg,var(--accent),#0288a6);color:#021214}
+    .btn-stop{background:var(--danger);color:#fff}
+    .status{font-size:13px;color:var(--muted);margin:6px 0}
+    label{display:block;font-size:13px;color:var(--muted);margin-top:8px}
+    input[type="range"]{width:100%}
+    .controls-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+    .small{font-size:13px;color:var(--muted)}
+    footer{font-size:12px;color:var(--muted);margin-top:12px;text-align:center}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Underwater Drone — Controls</h1>
+    <div class="status" id="status">Status: <strong id="stat">idle</strong></div>
+    <div style="display:flex;gap:8px;">
+      <button id="connect" disabled>Server Mode</button>
+      <button id="stop" class="btn-stop" title="Emergency stop">STOP</button>
+    </div>
+
+    <div style="margin-top:10px">
+      <div class="row">
+        <button id="forward" class="btn-action">Forward ▲</button>
+      </div>
+      <div class="row">
+        <button id="left">Left ◀</button>
+        <button id="right">Right ▶</button>
+      </div>
+      <div class="row">
+        <button id="back">Back ▼</button>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="up">Up ▲</button>
+        <button id="down">Down ▼</button>
+      </div>
+    </div>
+
+    <label>Thrust / speed <span id="spval" class="small">0.63</span></label>
+    <input id="speed" type="range" min="0" max="255" value="160" />
+
+    <div class="controls-grid">
+      <div>
+        <label>Top (fine control)</label>
+        <input id="topRange" type="range" min="-1" max="1" step="0.01" value="0" />
+      </div>
+      <div>
+        <label>Bottom (fine control)</label>
+        <input id="bottomRange" type="range" min="-1" max="1" step="0.01" value="0" />
+      </div>
+    </div>
+
+    <footer>
+      Control mode: Server &middot; Commands sent to server via POST /api/command
+    </footer>
+  </div>
+
+  <script>
+    // server will embed token via template variable if you set DRONE_AUTH_TOKEN
+    const TOKEN = "{{ token }}" || "";  // Jinja will substitute string; if empty, this literal is ""
+    const REST_BASE = window.location.origin;
+
+    const statEl = document.getElementById("stat");
+    const forwardBtn = document.getElementById("forward");
+    const leftBtn = document.getElementById("left");
+    const rightBtn = document.getElementById("right");
+    const backBtn = document.getElementById("back");
+    const upBtn = document.getElementById("up");
+    const downBtn = document.getElementById("down");
+    const speedSlider = document.getElementById("speed");
+    const spval = document.getElementById("spval");
+    const topRange = document.getElementById("topRange");
+    const bottomRange = document.getElementById("bottomRange");
+    const stopBtn = document.getElementById("stop");
+
+    function setStatus(s){ statEl.textContent = s; }
+
+    function sendCommand(obj){
+      // ensure token present
+      if(TOKEN) obj.token = TOKEN;
+      fetch(REST_BASE + "/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(obj),
+      }).then(r => r.json()).then(j => { setStatus(JSON.stringify(j)); }).catch(e => { setStatus("send fail"); console.error(e); });
+    }
+
+    function frac(){ return parseInt(speedSlider.value,10)/255.0; }
+    spval.textContent = (parseInt(speedSlider.value,10)/255).toFixed(2);
+    speedSlider.addEventListener("input", ()=>{ spval.textContent = (parseInt(speedSlider.value,10)/255).toFixed(2); });
+
+    function bindPress(el, onfn){
+      el.addEventListener("touchstart", (e)=>{ e.preventDefault(); onfn(); });
+      el.addEventListener("mousedown", onfn);
+    }
+
+    bindPress(forwardBtn, ()=> sendCommand({_cmd:"forward", left: frac(), right: frac()}));
+    bindPress(backBtn,    ()=> sendCommand({_cmd:"back", left:-frac(), right:-frac()}));
+    bindPress(leftBtn,    ()=> sendCommand({_cmd:"left", left:-frac(), right: frac()}));
+    bindPress(rightBtn,   ()=> sendCommand({_cmd:"right", left: frac(), right:-frac()}));
+    bindPress(upBtn,      ()=> sendCommand({_cmd:"up", top: frac()}));
+    bindPress(downBtn,    ()=> sendCommand({_cmd:"down", bottom: frac()}));
+
+    stopBtn.addEventListener("click", ()=> sendCommand({_cmd:"stop", left:0, right:0, top:0, bottom:0}) );
+
+    topRange.addEventListener("input", ()=> sendCommand({top: parseFloat(topRange.value)}));
+    bottomRange.addEventListener("input", ()=> sendCommand({bottom: parseFloat(bottomRange.value)}));
+  </script>
+</body>
+</html>
