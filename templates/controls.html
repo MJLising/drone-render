@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Drone Controls</title>
-  <style> /* ... trimmed: copy your existing styles ... */ 
+  <style>
     :root{--bg:#0d1117;--card:#161b22;--accent:#06b6d4;--muted:#94a3b8;--danger:#ef4444}
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;background:var(--bg);color:#e6eef6;display:flex;align-items:center;justify-content:center;height:100vh}
     .card{width:360px;max-width:95vw;background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(0,0,0,.6)}
@@ -19,14 +19,17 @@
     .controls-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
     .small{font-size:13px;color:var(--muted)}
     footer{font-size:12px;color:var(--muted);margin-top:12px;text-align:center}
+    #thumb { display:block; margin:8px auto; max-width:100%; border-radius:6px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>Underwater Drone — Controls</h1>
-    <div class="status" id="status">Status: <strong id="stat">idle</strong></div>
+    <h1>Underwater Drone — Controls (cloud)</h1>
+    <div class="status" id="status">Status: <strong id="stat">disconnected</strong></div>
+
     <div style="display:flex;gap:8px;">
-      <button id="connect" disabled>Server Mode</button>
+      <button id="connect" class="">Connect</button>
+      <button id="disconnect" class="" disabled>Disconnect</button>
       <button id="stop" class="btn-stop" title="Emergency stop">STOP</button>
     </div>
 
@@ -53,26 +56,31 @@
 
     <div class="controls-grid">
       <div>
-        <label>Top (fine control)</label>
+        <label>Top (fine)</label>
         <input id="topRange" type="range" min="-1" max="1" step="0.01" value="0" />
       </div>
       <div>
-        <label>Bottom (fine control)</label>
+        <label>Bottom (fine)</label>
         <input id="bottomRange" type="range" min="-1" max="1" step="0.01" value="0" />
       </div>
     </div>
 
+    <img id="thumb" src="" alt="" />
+
     <footer>
-      Control mode: Server &middot; Commands sent to server via POST /api/command
+      Relay via MQTT broker · WebSocket status: <span id="wsinfo">disconnected</span>
     </footer>
   </div>
 
   <script>
-    // server will embed token via template variable if you set DRONE_AUTH_TOKEN
-    const TOKEN = "{{ token }}" || "";  // Jinja will substitute string; if empty, this literal is ""
-    const REST_BASE = window.location.origin;
+    const proto = (location.protocol === "https:") ? "wss" : "ws";
+    const WS_URL = `${proto}://${location.host}/ws`;
 
     const statEl = document.getElementById("stat");
+    const wsinfo = document.getElementById("wsinfo");
+    const connectBtn = document.getElementById("connect");
+    const disconnectBtn = document.getElementById("disconnect");
+    const stopBtn = document.getElementById("stop");
     const forwardBtn = document.getElementById("forward");
     const leftBtn = document.getElementById("left");
     const rightBtn = document.getElementById("right");
@@ -83,21 +91,64 @@
     const spval = document.getElementById("spval");
     const topRange = document.getElementById("topRange");
     const bottomRange = document.getElementById("bottomRange");
-    const stopBtn = document.getElementById("stop");
+    const thumb = document.getElementById("thumb");
 
+    let ws = null;
     function setStatus(s){ statEl.textContent = s; }
 
-    function sendCommand(obj){
-      // ensure token present
-      if(TOKEN) obj.token = TOKEN;
-      fetch(REST_BASE + "/api/command", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(obj),
-      }).then(r => r.json()).then(j => { setStatus(JSON.stringify(j)); }).catch(e => { setStatus("send fail"); console.error(e); });
+    function connectWS(){
+      if(ws) return;
+      setStatus("connecting...");
+      ws = new WebSocket(WS_URL);
+      ws.onopen = () => {
+        setStatus("open");
+        wsinfo.textContent = "connected";
+        connectBtn.disabled = true; disconnectBtn.disabled = false;
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const j = JSON.parse(ev.data);
+          if(j.type === "telemetry"){
+            setStatus(`label=${j.data.label} prob=${j.data.prob}`);
+          } else if(j.type === "thumb" && j.data){
+            // j.data is base64 jpg
+            thumb.src = "data:image/jpeg;base64," + j.data;
+          } else if(j.type === "info"){
+            wsinfo.textContent = j.data;
+          } else if(j.type === "ack"){
+            // ignore
+          }
+        } catch(e){
+          console.log("ws msg:", ev.data);
+        }
+      };
+      ws.onclose = () => {
+        wsinfo.textContent = "closed";
+        setStatus("disconnected");
+        connectBtn.disabled = false; disconnectBtn.disabled = true;
+        ws = null;
+      };
+      ws.onerror = (e) => {
+        wsinfo.textContent = "error";
+        setStatus("ws error");
+      };
     }
 
-    function frac(){ return parseInt(speedSlider.value,10)/255.0; }
+    function disconnectWS(){ if(!ws) return; try{ ws.close(); }catch(e){} ws=null; setStatus("disconnected"); }
+
+    function sendWS(obj){
+      if(!ws || ws.readyState !== 1){ setStatus("ws closed"); return false; }
+      try{ ws.send(JSON.stringify(obj)); return true; }catch(e){ setStatus("send failed"); return false; }
+    }
+
+    function sendCmdCmd(cmd){
+      // discrete command via _cmd
+      sendWS({ _cmd: cmd, speed: parseInt(speedSlider.value,10) });
+    }
+    function sendNumericMap(vals){ sendWS(vals); }
+
+    connectBtn.addEventListener("click", connectWS);
+    disconnectBtn.addEventListener("click", disconnectWS);
     spval.textContent = (parseInt(speedSlider.value,10)/255).toFixed(2);
     speedSlider.addEventListener("input", ()=>{ spval.textContent = (parseInt(speedSlider.value,10)/255).toFixed(2); });
 
@@ -105,18 +156,23 @@
       el.addEventListener("touchstart", (e)=>{ e.preventDefault(); onfn(); });
       el.addEventListener("mousedown", onfn);
     }
+    bindPress(forwardBtn, ()=>{ sendCmdCmd("forward"); });
+    bindPress(backBtn, ()=>{ sendCmdCmd("back"); });
+    bindPress(leftBtn, ()=>{ sendCmdCmd("left"); });
+    bindPress(rightBtn, ()=>{ sendCmdCmd("right"); });
+    bindPress(upBtn, ()=>{ sendCmdCmd("up"); });
+    bindPress(downBtn, ()=>{ sendCmdCmd("down"); });
 
-    bindPress(forwardBtn, ()=> sendCommand({_cmd:"forward", left: frac(), right: frac()}));
-    bindPress(backBtn,    ()=> sendCommand({_cmd:"back", left:-frac(), right:-frac()}));
-    bindPress(leftBtn,    ()=> sendCommand({_cmd:"left", left:-frac(), right: frac()}));
-    bindPress(rightBtn,   ()=> sendCommand({_cmd:"right", left: frac(), right:-frac()}));
-    bindPress(upBtn,      ()=> sendCommand({_cmd:"up", top: frac()}));
-    bindPress(downBtn,    ()=> sendCommand({_cmd:"down", bottom: frac()}));
+    stopBtn.addEventListener("click", ()=>{ sendCmdCmd("stop"); });
 
-    stopBtn.addEventListener("click", ()=> sendCommand({_cmd:"stop", left:0, right:0, top:0, bottom:0}) );
+    let lastTop=0; topRange.addEventListener("input", ()=>{
+      const v=parseFloat(topRange.value); if(Math.abs(v-lastTop)<0.01) return; lastTop=v; sendNumericMap({top:v,left:0,right:0,bottom:0});
+    });
+    let lastBottom=0; bottomRange.addEventListener("input", ()=>{
+      const v=parseFloat(bottomRange.value); if(Math.abs(v-lastBottom)<0.01) return; lastBottom=v; sendNumericMap({bottom:v,left:0,right:0,top:0});
+    });
 
-    topRange.addEventListener("input", ()=> sendCommand({top: parseFloat(topRange.value)}));
-    bottomRange.addEventListener("input", ()=> sendCommand({bottom: parseFloat(bottomRange.value)}));
+    window.addEventListener("pagehide", ()=>{ if(ws) try{ ws.close(); }catch{} });
   </script>
 </body>
 </html>
