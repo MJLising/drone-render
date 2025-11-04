@@ -1,55 +1,111 @@
-# app.py
-import os, json, time
-from fastapi import FastAPI, Request, HTTPException, Form
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-import paho.mqtt.publish as publish
+# app.py  (Render-side, public)
+import os
+import json
+import asyncio
+import base64
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 import paho.mqtt.client as mqtt
+from typing import Set
 
-APP_PORT = int(os.getenv("PORT", "8000"))
-MQTT_BROKER = os.getenv("MQTT_BROKER", "broker.hivemq.com")
+APP = FastAPI()
+BASE_DIR = os.path.dirname(__file__)
+CONTROLS_PATH = os.path.join(BASE_DIR, "controls.html")
+
+MQTT_BROKER = os.getenv("MQTT_BROKER", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
-# topic should be unique per device/pi (use device id)
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "drone/controls/mydevice")
-DRONE_AUTH_TOKEN = os.getenv("DRONE_AUTH_TOKEN", "")  # shared secret
+MQTT_USER = os.getenv("MQTT_USER", "")
+MQTT_PASS = os.getenv("MQTT_PASS", "")
+DRONE_ID = os.getenv("DRONE_ID", "drone1")
 
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+TOPIC_CMD = f"drone/{DRONE_ID}/cmd"
+TOPIC_TELE = f"drone/{DRONE_ID}/telemetry"
+TOPIC_THUMB = f"drone/{DRONE_ID}/thumb"
 
-# serve static controls page
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    return templates.TemplateResponse("controls.html", {"request": request, "token": DRONE_AUTH_TOKEN})
+# connected websockets
+clients: Set[WebSocket] = set()
+loop = asyncio.get_event_loop()
 
-# publish JSON to MQTT. Token is required in the posted payload.
-@app.post("/api/command")
-async def api_command(payload: dict = None, token: str = Form(None)):
-    # Payload may come as JSON form or via JSON body: form field 'token' or JSON 'token' accepted
-    body = payload or {}
-    # token check (first try body then form param)
-    tkn = body.get("token") if body.get("token") else token
-    if DRONE_AUTH_TOKEN:
-        if not tkn or tkn != DRONE_AUTH_TOKEN:
-            raise HTTPException(status_code=401, detail="missing/invalid token")
-    # attach server timestamp
-    body["_ts"] = int(time.time())
-    payload_bytes = json.dumps(body).encode("utf-8")
-    # publish (no blocking broker auth if not provided)
-    auth = None
-    if MQTT_USERNAME and MQTT_PASSWORD:
-        auth = {'username': MQTT_USERNAME, 'password': MQTT_PASSWORD}
+# MQTT callbacks
+def on_connect(client, userdata, flags, rc):
+    print("[MQTT] connected rc=", rc)
+    client.subscribe(TOPIC_TELE)
+    client.subscribe(TOPIC_THUMB)
+
+def on_message(client, userdata, msg):
+    topic = msg.topic
+    payload = msg.payload
+    # forward to websockets
+    data = None
+    if topic == TOPIC_TELE:
+        try:
+            data = {"type": "telemetry", "data": json.loads(payload.decode('utf-8'))}
+        except Exception:
+            data = {"type":"telemetry","data":payload.decode('utf-8', errors='ignore')}
+    elif topic == TOPIC_THUMB:
+        try:
+            b64 = payload.decode('ascii')
+            data = {"type":"thumb","data": b64}
+        except Exception:
+            data = {"type":"thumb","data": None}
+    else:
+        data = {"type":"unknown","topic":topic,"data":payload.decode('utf-8',errors='ignore')}
+    # schedule send to websockets
+    coro = broadcast(json.dumps(data))
     try:
-        publish.single(MQTT_TOPIC, payload_bytes, hostname=MQTT_BROKER, port=MQTT_PORT, auth=auth, keepalive=30)
+        asyncio.run_coroutine_threadsafe(coro, loop)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"MQTT publish failed: {e}")
-    return {"published_to": MQTT_TOPIC, "payload": body}
+        print("[MQTT] broadcast schedule error:", e)
 
-# health endpoint
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# start mqtt client in background thread
+mqtt_client = mqtt.Client()
+if MQTT_USER:
+    mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS or None)
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+try:
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    mqtt_client.loop_start()
+    print("[MQTT] started client")
+except Exception as e:
+    print("[MQTT] connect error:", e)
 
-# optionally run with uvicorn on Render; Render populates $PORT automatically
+@APP.get("/")
+def index():
+    if os.path.exists(CONTROLS_PATH):
+        return FileResponse(CONTROLS_PATH, media_type="text/html")
+    return {"status":"controls.html missing"}
+
+# websocket endpoint for browser UI
+@APP.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
+    try:
+        await ws.send_text(json.dumps({"type":"info","data":"connected to relay"}))
+        while True:
+            txt = await ws.receive_text()
+            try:
+                payload = json.loads(txt)
+            except Exception:
+                payload = {"_cmd": txt}
+            # publish to mqtt
+            try:
+                mqtt_client.publish(TOPIC_CMD, json.dumps(payload))
+            except Exception as e:
+                print("[WS] mqtt publish error:", e)
+            # optionally echo back
+            await ws.send_text(json.dumps({"type":"ack","data":payload}))
+    except WebSocketDisconnect:
+        clients.discard(ws)
+
+async def broadcast(msg: str):
+    # send to all connected websockets
+    to_remove = []
+    for c in list(clients):
+        try:
+            await c.send_text(msg)
+        except Exception:
+            to_remove.append(c)
+    for c in to_remove:
+        clients.discard(c)
